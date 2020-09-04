@@ -1,1 +1,163 @@
 
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create S3 website
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain name
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: Provide a valid DomainName
+  FQDN:
+    Type: String
+    Description: FQDN
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: Provide valid DNS FQDN.
+  CertificateArn:
+    Type: String
+    Description: ARN For certificate (To make HTTPS).
+    AllowedPattern: "arn:aws:acm:.*"
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref 'FQDN'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: 404.html
+	  AccessControl: PublicRead
+    DeletionPolicy: Retain
+
+  DNS:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      HostedZoneConfig:
+        Comment: !Join ['', ['Hosted Zone- ', !Ref 'DomainName']]
+      Name: !Ref 'DomainName'
+      HostedZoneTags:
+      - Key: Purpose
+        Value: Assignment
+		
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref 'S3Bucket'
+      PolicyDocument:
+        Statement:
+        - Sid: PublicAccessForObjects
+          Effect: Allow
+          Principal: '*'
+          Action: s3:GetObject
+          Resource: !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', /*]]
+		  
+  CloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+    - S3Bucket
+    Properties:
+      DistributionConfig:
+        Comment: CloudFront-distribution-for-S3-Origin
+        Origins:
+        - DomainName: !Select [2, !Split ["/", !GetAtt S3Bucket.WebsiteURL]]
+          Id: S3Origin
+          CustomOriginConfig:
+            HTTPPort: '80'
+            HTTPSPort: '443'
+            OriginProtocolPolicy: http-only
+        Enabled: true
+        HttpVersion: 'http2'
+        DefaultRootObject: index.html
+        Aliases:
+        - !Ref 'FQDN'
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - GET
+          - HEAD
+          Compress: true
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+
+  VisitCounterTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "Site"
+          AttributeType: "N"
+      KeySchema: 
+        - 
+          AttributeName: "Site"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: "WesbsiteCounter"
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CounterLambdaRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      Path: /
+  
+  Function: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: lambda_handler.handler
+      Role: !Ref LambdaRole
+      Code: 
+        ZipFile: |
+		  import boto3
+		  import os
+		  client = boto3.client('dynamodb')
+		  def handler(event, context):
+		    table_name = os.environ['DYNAMO_TABLE']
+			## Counter increment logic
+      Runtime: python37
+      Timeout: 300
+      TracingConfig:
+        Mode: Active
+	  Environment:
+	    Variables:
+		  DYNAMO_TABLE : !Ref VisitCounterTable
+		  
+		  
+  WebsiteDNSName:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ['', [!Ref 'DomainName', .]]
+      RecordSets:
+      - Name: !Ref 'FQDN'
+        Type: A
+        AliasTarget:
+          HostedZoneId: !Ref HostedZoneId
+          DNSName: !GetAtt [CloudfrontDistribution, DomainName]
+Outputs:
+  BucketName:
+    Value: !Ref 'S3Bucket'
+    Description: S3 bucket for website
+  CloudfrontEndpoint:
+    Value: !GetAtt [CloudfrontDistribution, DomainName]
+    Description: Distribution Endpoint
+  FQDN:
+    Value: !Ref 'FullDomainName'
+    Description: Full DomainName
